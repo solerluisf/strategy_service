@@ -1,0 +1,30 @@
+# strategy.toml — reloaded without restart via Orchestrator command
+
+strategy_id = "momentum_v1"
+strategy_version = "1.0.0"
+
+long_entry_threshold = 0.6
+short_entry_threshold = -0.6
+exit_threshold = 0.1
+confidence_minimum = 0.5
+hysteresis_band = 0.15
+
+entry_cooldown_ms = 5000
+exit_cooldown_ms = 2000
+
+suppress_entries_in_volatile = true
+suppress_exits_in_ranging = false
+
+max_long_units = 1000.0
+max_short_units = 1000.0
+allow_short = false
+
+sizing_method = "PortfolioPct"
+base_size = 0.02
+scale_by_confidence = true
+
+inference_staleness_ms = 2000
+intent_ttl_ms = 30000
+
+aggressive_threshold = 0.85
+passive_threshold = 0.65
