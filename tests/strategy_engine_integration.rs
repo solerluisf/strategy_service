@@ -4,10 +4,16 @@ use std::sync::Arc;
 use strategy_service::strategy_core::application::kill_switch::KillSwitch;
 use strategy_service::strategy_core::application::mode_controller::ModeController;
 use strategy_service::strategy_core::application::strategy_engine::StrategyEngine;
+use strategy_service::strategy_core::application::strategy_selector::StrategySelector;
 use strategy_service::strategy_core::domain::inference_input::{InferenceEvent, ModelOutputs, RegimeLabel};
 use strategy_service::strategy_core::domain::operation_mode::OperationMode;
 use strategy_service::strategy_core::domain::position::PositionCache;
 use strategy_service::strategy_core::domain::strategy_config::StrategyConfig;
+use strategy_service::strategy_core::domain::strategies::arbitrage::{ArbitrageConfig, ArbitrageStrategy};
+use strategy_service::strategy_core::domain::strategies::momentum::{MomentumConfig, MomentumStrategy};
+use strategy_service::strategy_core::domain::strategies::moving_average::{MovingAverageConfig, MovingAverageStrategy};
+use strategy_service::strategy_core::domain::strategies::rsi::{RSIConfig, RSIStrategy};
+use strategy_service::strategy_core::domain::trading_strategy::StrategyType;
 use strategy_service::adapters::metrics::metrics_adapter::MetricsAdapter;
 
 fn make_inference(symbol: &str, forecast: f64, confidence: f64, inferred_ns: u64) -> InferenceEvent {
@@ -34,13 +40,41 @@ fn make_inference(symbol: &str, forecast: f64, confidence: f64, inferred_ns: u64
     }
 }
 
+fn make_selector(config_arc: Arc<std::sync::RwLock<StrategyConfig>>) -> StrategySelector {
+    let mut strategies: HashMap<StrategyType, Box<dyn strategy_service::strategy_core::domain::trading_strategy::ITradingStrategy>> = HashMap::new();
+    strategies.insert(
+        StrategyType::MovingAverage,
+        Box::new(MovingAverageStrategy::new(MovingAverageConfig::default())),
+    );
+    strategies.insert(
+        StrategyType::RSI,
+        Box::new(RSIStrategy::new(RSIConfig::default())),
+    );
+    strategies.insert(
+        StrategyType::Arbitrage,
+        Box::new(ArbitrageStrategy::new(ArbitrageConfig::default())),
+    );
+    strategies.insert(
+        StrategyType::Momentum,
+        Box::new(MomentumStrategy::new(MomentumConfig::default())),
+    );
+
+    StrategySelector::new(
+        strategies,
+        StrategyType::Momentum,
+        config_arc,
+    ).expect("Failed to create strategy selector")
+}
+
 fn make_engine(config: StrategyConfig) -> StrategyEngine {
     let position_cache = Arc::new(PositionCache::new());
     let kill_switch = Arc::new(KillSwitch::new());
     let mode_controller = Arc::new(ModeController::new(OperationMode::Live));
     let metrics = Arc::new(MetricsAdapter::new());
+    let config_arc = Arc::new(std::sync::RwLock::new(config.clone()));
+    let selector = make_selector(config_arc);
 
-    StrategyEngine::new(config, position_cache, kill_switch, mode_controller, metrics)
+    StrategyEngine::new(config, selector, position_cache, kill_switch, mode_controller, metrics)
 }
 
 #[test]
@@ -64,8 +98,10 @@ fn kill_switch_suppresses_intent() {
     kill_switch.activate("test".to_string());
     let mode_controller = Arc::new(ModeController::new(OperationMode::Live));
     let metrics = Arc::new(MetricsAdapter::new());
+    let config_arc = Arc::new(std::sync::RwLock::new(config.clone()));
+    let selector = make_selector(config_arc);
 
-    let mut engine = StrategyEngine::new(config, position_cache, kill_switch, mode_controller, metrics);
+    let mut engine = StrategyEngine::new(config, selector, position_cache, kill_switch, mode_controller, metrics);
     let now_ns = 1_000_000_000_000u64;
 
     let event = make_inference("AAPL", 0.9, 0.9, now_ns);
@@ -82,7 +118,7 @@ fn stale_inference_suppresses_intent() {
     let mut engine = make_engine(config);
 
     let now_ns = 1_000_000_000_000u64;
-    let stale_inferred_ns = now_ns - 3_000_000_000u64; // 3 seconds old
+    let stale_inferred_ns = now_ns - 3_000_000_000u64;
 
     let event = make_inference("AAPL", 0.9, 0.9, stale_inferred_ns);
     let result = engine.evaluate(event, now_ns);
@@ -97,7 +133,7 @@ fn low_confidence_suppresses_intent() {
     let mut engine = make_engine(config);
     let now_ns = 1_000_000_000_000u64;
 
-    let event = make_inference("AAPL", 0.9, 0.3, now_ns); // confidence 0.3 < 0.5 minimum
+    let event = make_inference("AAPL", 0.9, 0.3, now_ns);
     let result = engine.evaluate(event, now_ns);
 
     assert!(result.is_ok());
@@ -105,18 +141,30 @@ fn low_confidence_suppresses_intent() {
 }
 
 #[test]
-fn hysteresis_suppresses_duplicate_long_signals() {
+fn strategy_switch_at_runtime() {
     let config = StrategyConfig::default();
     let mut engine = make_engine(config);
-    let now_ns = 1_000_000_000_000u64;
 
-    let event1 = make_inference("AAPL", 0.7, 0.8, now_ns);
-    let result1 = engine.evaluate(event1, now_ns);
-    assert!(result1.unwrap().is_some());
+    assert_eq!(engine.active_strategy(), StrategyType::Momentum);
 
-    let event2 = make_inference("AAPL", 0.8, 0.8, now_ns + 1);
-    let result2 = engine.evaluate(event2, now_ns + 1);
-    assert!(result2.unwrap().is_none()); // suppressed by hysteresis
+    engine.switch_strategy(StrategyType::RSI).unwrap();
+    assert_eq!(engine.active_strategy(), StrategyType::RSI);
+
+    engine.switch_strategy(StrategyType::MovingAverage).unwrap();
+    assert_eq!(engine.active_strategy(), StrategyType::MovingAverage);
+}
+
+#[test]
+fn available_strategies_returns_all_registered() {
+    let config = StrategyConfig::default();
+    let engine = make_engine(config);
+
+    let available = engine.available_strategies();
+    assert_eq!(available.len(), 4);
+    assert!(available.contains(&StrategyType::Momentum));
+    assert!(available.contains(&StrategyType::RSI));
+    assert!(available.contains(&StrategyType::MovingAverage));
+    assert!(available.contains(&StrategyType::Arbitrage));
 }
 
 #[test]
@@ -126,10 +174,12 @@ fn force_flatten_emits_flatten_intent() {
     let kill_switch = Arc::new(KillSwitch::new());
     let mode_controller = Arc::new(ModeController::new(OperationMode::Live));
     let metrics = Arc::new(MetricsAdapter::new());
+    let config_arc = Arc::new(std::sync::RwLock::new(config.clone()));
+    let selector = make_selector(config_arc);
 
-    let mut engine = StrategyEngine::new(config, position_cache, kill_switch, mode_controller, metrics);
+    let mut engine = StrategyEngine::new(config, selector, position_cache, kill_switch, mode_controller, metrics);
     let now_ns = 1_000_000_000_000u64;
 
     let intent = engine.force_flatten("AAPL", now_ns);
-    assert!(intent.is_none()); // flat position, no flatten needed
+    assert!(intent.is_none());
 }

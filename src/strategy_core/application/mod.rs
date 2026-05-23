@@ -1,4 +1,5 @@
 pub mod strategy_engine;
+pub mod strategy_selector;
 pub mod rules;
 pub mod position_cache;
 pub mod idempotency;

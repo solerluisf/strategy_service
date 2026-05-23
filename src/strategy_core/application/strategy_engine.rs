@@ -11,15 +11,18 @@ use crate::strategy_core::application::rules::regime_gate::RegimeGate;
 use crate::strategy_core::application::rules::sizing_engine::SizingEngine;
 use crate::strategy_core::application::rules::staleness_guard::{StalenessGuard, StalenessResult};
 use crate::strategy_core::application::rules::threshold_gate::{ThresholdDecision, ThresholdGate};
+use crate::strategy_core::application::strategy_selector::StrategySelector;
 use crate::strategy_core::domain::errors::StrategyError;
 use crate::strategy_core::domain::inference_input::InferenceEvent;
 use crate::strategy_core::domain::position::PositionCache;
 use crate::strategy_core::domain::strategy_config::StrategyConfig;
 use crate::strategy_core::domain::trade_intent::{IntentSide, IntentType, IntentUrgency, TradeIntent};
+use crate::strategy_core::domain::trading_strategy::StrategyType;
 use crate::strategy_core::ports::metrics_port::IMetricsPort;
 
 pub struct StrategyEngine {
     config: Arc<std::sync::RwLock<StrategyConfig>>,
+    selector: StrategySelector,
     hysteresis: HysteresisFilter,
     cooldown: CooldownTracker,
     staleness_guard: StalenessGuard,
@@ -35,6 +38,7 @@ pub struct StrategyEngine {
 impl StrategyEngine {
     pub fn new(
         config: StrategyConfig,
+        selector: StrategySelector,
         position_cache: Arc<PositionCache>,
         kill_switch: Arc<KillSwitch>,
         mode_controller: Arc<ModeController>,
@@ -43,6 +47,7 @@ impl StrategyEngine {
         let staleness_guard = StalenessGuard::new(config.inference_staleness_ms);
         Self {
             config: Arc::new(std::sync::RwLock::new(config)),
+            selector,
             hysteresis: HysteresisFilter::new(),
             cooldown: CooldownTracker::new(),
             staleness_guard,
@@ -74,9 +79,6 @@ impl StrategyEngine {
             return Ok(None);
         }
 
-        let forecast = event.outputs.forecast.unwrap_or(0.0);
-        let confidence = event.outputs.confidence.unwrap_or(0.0);
-
         match self.staleness_guard.check(event.inferred_ns, now_ns) {
             StalenessResult::Stale { age_ms } => {
                 tracing::debug!(
@@ -92,33 +94,54 @@ impl StrategyEngine {
             StalenessResult::Fresh => {}
         }
 
+        self.selector.select_by_regime(&event.regime).ok();
+
+        let strategy_signal = self.selector.evaluate(&event);
+
         let config = self.config.read().unwrap();
 
-        let decision = ThresholdGate::evaluate(forecast, confidence, &config);
-        if matches!(decision, ThresholdDecision::NoSignal) {
-            self.metrics.increment_counter(
-                "strategy_suppressed_by_threshold",
-                &[("symbol", &event.symbol)],
-            );
-            return Ok(None);
-        }
-
-        let hyst_result = self.hysteresis.check(&event.symbol, decision, forecast, &config);
-        match hyst_result {
-            HysteresisResult::Suppress => {
-                self.metrics.increment_counter(
-                    "strategy_suppressed_by_hysteresis",
-                    &[("symbol", &event.symbol)],
-                );
-                return Ok(None);
+        let (side, intent_type, forecast) = match strategy_signal {
+            Some(signal) => {
+                let forecast = signal.strength;
+                let confidence = event.outputs.confidence.unwrap_or(0.0);
+                if confidence < config.confidence_minimum {
+                    self.metrics.increment_counter(
+                        "strategy_suppressed_by_threshold",
+                        &[("symbol", &event.symbol)],
+                    );
+                    return Ok(None);
+                }
+                (signal.side, signal.intent_type, forecast)
             }
-            HysteresisResult::Allow(_) => {}
-        }
+            None => {
+                let forecast = event.outputs.forecast.unwrap_or(0.0);
+                let confidence = event.outputs.confidence.unwrap_or(0.0);
+                let decision = ThresholdGate::evaluate(forecast, confidence, &config);
+                if matches!(decision, ThresholdDecision::NoSignal) {
+                    self.metrics.increment_counter(
+                        "strategy_suppressed_by_threshold",
+                        &[("symbol", &event.symbol)],
+                    );
+                    return Ok(None);
+                }
+                let hyst_result = self.hysteresis.check(&event.symbol, decision, forecast, &config);
+                match hyst_result {
+                    HysteresisResult::Suppress => {
+                        self.metrics.increment_counter(
+                            "strategy_suppressed_by_hysteresis",
+                            &[("symbol", &event.symbol)],
+                        );
+                        return Ok(None);
+                    }
+                    HysteresisResult::Allow(_) => {}
+                }
+                let position = self.position_cache.get(&event.symbol);
+                let (side, intent_type) = decision_to_side_and_type(&hyst_result, &position, &config);
+                (side, intent_type, forecast)
+            }
+        };
 
         let position = self.position_cache.get(&event.symbol);
-        let (side, intent_type) =
-            decision_to_side_and_type(&hyst_result, &position, &config);
-
         let position_result = PositionGate::check(&position, &side, &config);
         match position_result {
             PositionGateResult::Suppress { reason } => {
@@ -192,6 +215,11 @@ impl StrategyEngine {
             &[("symbol", &intent.symbol), ("side", intent_side_str(&side))],
         );
 
+        self.metrics.increment_counter(
+            "strategy_active",
+            &[("strategy", &self.selector.active_strategy().to_string())],
+        );
+
         Ok(Some(intent))
     }
 
@@ -201,9 +229,31 @@ impl StrategyEngine {
         self.metrics.increment_counter("strategy_config_reloads_total", &[]);
     }
 
+    pub fn switch_strategy(&mut self, strategy_type: StrategyType) -> Result<(), String> {
+        self.selector.set_active_strategy(strategy_type)?;
+        self.metrics.increment_counter(
+            "strategy_switches_total",
+            &[("strategy", &strategy_type.to_string())],
+        );
+        Ok(())
+    }
+
+    pub fn active_strategy(&self) -> StrategyType {
+        self.selector.active_strategy()
+    }
+
+    pub fn available_strategies(&self) -> Vec<StrategyType> {
+        self.selector.available_strategies()
+    }
+
+    pub fn get_strategy_info(&self) -> HashMap<String, String> {
+        self.selector.get_strategy_info()
+    }
+
     pub fn reset_symbol_state(&mut self, symbol: &str) {
         self.hysteresis.reset(symbol);
         self.cooldown.reset(symbol);
+        self.selector.reset_symbol_state(symbol);
     }
 
     pub fn force_flatten(&mut self, symbol: &str, now_ns: u64) -> Option<TradeIntent> {

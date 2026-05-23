@@ -27,7 +27,7 @@ pub struct ModelOutputs {
     pub raw: HashMap<String, f64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum RegimeLabel {
     Ranging,
     Trending,

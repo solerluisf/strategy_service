@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+use crate::strategy_core::domain::trading_strategy::StrategyType;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyConfig {
     pub strategy_id: String,
     pub strategy_version: String,
+
+    pub active_strategy: StrategyType,
 
     pub long_entry_threshold: f64,
     pub short_entry_threshold: f64,
@@ -47,6 +51,7 @@ impl Default for StrategyConfig {
         Self {
             strategy_id: "default".to_string(),
             strategy_version: "1.0.0".to_string(),
+            active_strategy: StrategyType::Momentum,
             long_entry_threshold: 0.6,
             short_entry_threshold: -0.6,
             exit_threshold: 0.1,

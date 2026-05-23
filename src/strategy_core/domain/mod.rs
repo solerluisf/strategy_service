@@ -5,3 +5,5 @@ pub mod position;
 pub mod strategy_config;
 pub mod operation_mode;
 pub mod errors;
+pub mod trading_strategy;
+pub mod strategies;

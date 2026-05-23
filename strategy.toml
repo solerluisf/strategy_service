@@ -3,6 +3,8 @@
 strategy_id = "momentum_v1"
 strategy_version = "1.0.0"
 
+active_strategy = "Momentum"
+
 long_entry_threshold = 0.6
 short_entry_threshold = -0.6
 exit_threshold = 0.1

@@ -1,12 +1,19 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use strategy_service::config::app_config::AppConfig;
 use strategy_service::strategy_core::application::kill_switch::KillSwitch;
 use strategy_service::strategy_core::application::mode_controller::ModeController;
 use strategy_service::strategy_core::application::strategy_engine::StrategyEngine;
+use strategy_service::strategy_core::application::strategy_selector::StrategySelector;
 use strategy_service::strategy_core::application::strategy_service::StrategyService;
 use strategy_service::strategy_core::domain::position::PositionCache;
 use strategy_service::strategy_core::domain::strategy_config::StrategyConfig;
+use strategy_service::strategy_core::domain::strategies::arbitrage::{ArbitrageConfig, ArbitrageStrategy};
+use strategy_service::strategy_core::domain::strategies::momentum::{MomentumConfig, MomentumStrategy};
+use strategy_service::strategy_core::domain::strategies::moving_average::{MovingAverageConfig, MovingAverageStrategy};
+use strategy_service::strategy_core::domain::strategies::rsi::{RSIConfig, RSIStrategy};
+use strategy_service::strategy_core::domain::trading_strategy::StrategyType;
 use strategy_service::adapters::messaging::heartbeat_publisher::HeartbeatPublisher;
 use strategy_service::adapters::messaging::inference_subscriber::InferenceSubscriber;
 use strategy_service::adapters::messaging::intent_publisher::IntentPublisher;
@@ -54,8 +61,35 @@ async fn main() {
     let risk_gate: Arc<RiskGateClient> =
         Arc::new(RiskGateClient::spawn(&config.risk_router_endpoint));
 
+    let config_arc = Arc::new(std::sync::RwLock::new(strategy_config.clone()));
+
+    let mut strategies: HashMap<StrategyType, Box<dyn strategy_service::strategy_core::domain::trading_strategy::ITradingStrategy>> = HashMap::new();
+    strategies.insert(
+        StrategyType::MovingAverage,
+        Box::new(MovingAverageStrategy::new(MovingAverageConfig::default())),
+    );
+    strategies.insert(
+        StrategyType::RSI,
+        Box::new(RSIStrategy::new(RSIConfig::default())),
+    );
+    strategies.insert(
+        StrategyType::Arbitrage,
+        Box::new(ArbitrageStrategy::new(ArbitrageConfig::default())),
+    );
+    strategies.insert(
+        StrategyType::Momentum,
+        Box::new(MomentumStrategy::new(MomentumConfig::default())),
+    );
+
+    let selector = StrategySelector::new(
+        strategies,
+        strategy_config.active_strategy.clone(),
+        config_arc.clone(),
+    ).expect("Failed to create strategy selector");
+
     let engine = StrategyEngine::new(
         strategy_config,
+        selector,
         position_cache.clone(),
         kill_switch.clone(),
         mode_controller.clone(),
